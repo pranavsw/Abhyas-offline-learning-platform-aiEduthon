@@ -35,6 +35,10 @@ dependencies:
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
   flutter_gemma: ^0.11.0
+  tflite_flutter: ^0.11.0
+  sqflite: ^2.3.0
+  path: ^1.9.0
+
 
 dev_dependencies:
   flutter_test:
@@ -58,6 +62,10 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
+  assets:
+    - assets/class9_complete.db
+    - assets/mobile_embedding.tflite
+    - assets/vocab.txt
   # To add assets to your application, add an assets section, like this:
   # assets:
   #   - images/a_dot_burr.jpeg
