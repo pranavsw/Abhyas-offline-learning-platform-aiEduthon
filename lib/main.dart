@@ -15,7 +15,10 @@ import 'package:tflite_flutter/tflite_flutter.dart';
 // -----------------------------------------------------------------------------
 const String kHuggingFaceToken = "YOUR_HF_TOKEN";
 const String kModelUrl =
-    'https://huggingface.co/google/gemma-2b-it-tflite/resolve/main/gemma-2b-it-cpu-int4.bin';
+    'https://huggingface.co/litert-community/Gemma3-1B-IT/resolve/main/gemma3-1b-it-int4.task';
+
+// const String kModelUrl =
+// 'https://huggingface.co/google/gemma-2b-it-tflite/resolve/main/gemma-2b-it-cpu-int4.bin';
 
 // -----------------------------------------------------------------------------
 // MAIN ENTRY POINT
@@ -302,6 +305,18 @@ class _QuizPlayScreenState extends State<QuizPlayScreen> {
     _generateNewQuestion();
   }
 
+  // Persistent chat session to avoid memory leaks
+  InferenceChat? _chatSession;
+
+  @override
+  void dispose() {
+    // Note: InferenceChat doesn't have a dispose method exposed in the package currently,
+    // but we should at least null it out. The underlying C++ resources *should* be managed by the GC
+    // or the FlutterGemma singleton, but creating NEW sessions repeatedly was the issue.
+    _chatSession = null;
+    super.dispose();
+  }
+
   Future<void> _generateNewQuestion() async {
     setState(() {
       _isLoading = true;
@@ -317,112 +332,170 @@ class _QuizPlayScreenState extends State<QuizPlayScreen> {
         widget.chapterTitle,
       );
 
-      if (context.isEmpty) {
-        throw "No content available for this chapter";
-      }
+      if (context.isEmpty) throw "No content available";
 
-      // 2. Try AI Generation with strict safeguards
-      String questionText = "";
-      try {
+      String question = "";
+      String correctAnswer = "";
+      List<String> options = [];
+
+      // 2. Initialize Model & Chat (Reuse session if possible)
+      if (_chatSession == null) {
         final model = await FlutterGemma.getActiveModel(
           preferredBackend: PreferredBackend.cpu,
         );
-        final chat = await model.createChat();
+        _chatSession = await model.createChat();
+      }
 
-        // Very simple prompt
-        await chat.addQueryChunk(
-          Message.text(
-            text:
-                "Write one simple question about this text:\n\n$context\n\nQuestion:",
-            isUser: true,
-          ),
-        );
+      // ---------------------------------------------------------
+      // STEP 1: Generate Question and Correct Answer
+      // ---------------------------------------------------------
+      // We use a "Forget previous" trick or just context injection to keep it stateless-ish
+      String prompt1 =
+          """Context:
+$context
 
-        int tokenCount = 0;
-        int badTokenCount = 0;
-        const int maxTokens = 60;
+Task: Write 1 simple question and its correct answer based on the text.
+Format:
+Q: [Question]
+A: [Answer]""";
 
-        final stream = chat.generateChatResponseAsync();
-        await for (final event in stream) {
-          if (event is TextResponse) {
-            String token = event.token;
+      // Note: We are appending to history. To prevent context window explosion after 10 questions,
+      // we ideally need a way to clear history. Since the package doesn't expose it,
+      // we will rely on the fact that we are reusing the session.
+      // IF the model gets confused by previous questions, we might need to force a new session
+      // every X questions. For now, let's try reusing it to fix the CRASH.
 
-            // CRITICAL FIX: Detect infinite loop of special tokens
-            if (token.contains('<bos>') ||
-                token.contains('<eos>') ||
-                token.trim().isEmpty) {
-              badTokenCount++;
-              if (badTokenCount > 5) {
-                debugPrint(
-                  "Detected infinite loop of bad tokens. Aborting AI.",
-                );
-                break;
-              }
-              continue;
-            }
+      await _chatSession!.addQueryChunk(
+        Message.text(text: prompt1, isUser: true),
+      );
 
-            questionText += token;
-            tokenCount++;
-
-            if (tokenCount >= maxTokens) break;
-          }
+      String response1 = "";
+      int tokenCount = 0;
+      await for (final event in _chatSession!.generateChatResponseAsync()) {
+        if (event is TextResponse) {
+          String t = event.token;
+          if (t.contains('<bos>') || t.contains('<eos>')) continue;
+          response1 += t;
+          if (++tokenCount > 60) break;
         }
-      } catch (e) {
-        debugPrint("AI Generation failed: $e");
-        // Fallthrough to fallback
       }
 
-      questionText = questionText.trim();
+      // Parse Step 1
+      final qMatch = RegExp(r'Q:\s*(.+)').firstMatch(response1);
+      final aMatch = RegExp(r'A:\s*(.+)').firstMatch(response1);
 
-      // 3. FALLBACK: If AI failed (empty or loop), use deterministic generation
-      if (questionText.isEmpty || questionText.length < 5) {
-        debugPrint("Using deterministic fallback question");
-        final topicMatch = RegExp(r'TOPIC: (.*)').firstMatch(context);
-        String topic = topicMatch?.group(1) ?? "this chapter";
-        questionText = "What is the main subject discussed in '$topic'?";
-      }
-
-      // 4. Create options programmatically (Reliable)
-      List<String> words = context
-          .replaceAll(RegExp(r'[^\w\s]'), '')
-          .split(RegExp(r'\s+'))
-          .where((w) => w.length > 5) // Only longer words
-          .toSet() // Remove duplicates
-          .toList();
-
-      words.shuffle();
-
-      List<String> options = [];
-      if (words.length >= 4) {
-        options = words.take(4).toList();
+      if (qMatch != null && aMatch != null) {
+        question = qMatch.group(1)!.trim();
+        correctAnswer = aMatch.group(1)!.trim();
       } else {
-        options = [
-          "Understanding parents",
-          "Fear and authority",
-          "Family relationships",
-          "Childhood memories",
-        ];
+        // Fallback parsing
+        final parts = response1
+            .split('\n')
+            .where((l) => l.trim().isNotEmpty)
+            .toList();
+        if (parts.length >= 2) {
+          question = parts[0].replaceAll('Q:', '').trim();
+          correctAnswer = parts[1].replaceAll('A:', '').trim();
+        } else {
+          _useDeterministicFallback(context);
+          return;
+        }
       }
 
-      // Capitalize
-      options = options
-          .map((o) => o[0].toUpperCase() + o.substring(1).toLowerCase())
+      // ---------------------------------------------------------
+      // STEP 2: Generate Distractors (Wrong Options)
+      // ---------------------------------------------------------
+      String prompt2 = """Task: Write 3 short WRONG answers for that question.
+Format:
+1. [Wrong1]
+2. [Wrong2]
+3. [Wrong3]""";
+
+      await _chatSession!.addQueryChunk(
+        Message.text(text: prompt2, isUser: true),
+      );
+
+      String response2 = "";
+      tokenCount = 0;
+      await for (final event in _chatSession!.generateChatResponseAsync()) {
+        if (event is TextResponse) {
+          String t = event.token;
+          if (t.contains('<bos>') || t.contains('<eos>')) continue;
+          response2 += t;
+          if (++tokenCount > 60) break;
+        }
+      }
+
+      // Parse Step 2
+      final wrongOptions = response2
+          .split('\n')
+          .map((l) => l.replaceAll(RegExp(r'^\d+\.\s*'), '').trim())
+          .where(
+            (l) =>
+                l.isNotEmpty && l.toLowerCase() != correctAnswer.toLowerCase(),
+          )
+          .take(3)
           .toList();
+
+      // ---------------------------------------------------------
+      // Combine & Randomize
+      // ---------------------------------------------------------
+      options = [correctAnswer, ...wrongOptions];
+
+      // Ensure we ALWAYS have 4 options
+      int fallbackCount = 1;
+      while (options.length < 4) {
+        // Generate a dummy option that looks slightly real if possible, or just generic
+        options.add("Option $fallbackCount");
+        fallbackCount++;
+      }
+
+      options.shuffle();
 
       setState(() {
         _questionData = {
-          'question': questionText,
+          'question': question,
           'options': options,
-          'correct_answer': options[0],
+          'correct_answer': correctAnswer,
         };
         _isLoading = false;
       });
     } catch (e) {
+      debugPrint("Quiz Gen Error: $e");
       setState(() {
         _error = "Error: $e";
         _isLoading = false;
       });
+      // If error (e.g. context limit), reset session
+      _chatSession = null;
     }
+  }
+
+  void _useDeterministicFallback(String context) {
+    final topicMatch = RegExp(r'TOPIC: (.*)').firstMatch(context);
+    String topic = topicMatch?.group(1) ?? "this chapter";
+    String question = "What is the main subject discussed in '$topic'?";
+
+    List<String> words = context
+        .replaceAll(RegExp(r'[^\w\s]'), '')
+        .split(RegExp(r'\s+'))
+        .where((w) => w.length > 5)
+        .toSet()
+        .toList();
+    words.shuffle();
+
+    List<String> options = words.take(4).toList();
+    if (options.isEmpty)
+      options = ["Option A", "Option B", "Option C", "Option D"];
+
+    setState(() {
+      _questionData = {
+        'question': question,
+        'options': options,
+        'correct_answer': options[0],
+      };
+      _isLoading = false;
+    });
   }
 
   @override
@@ -442,23 +515,26 @@ class _QuizPlayScreenState extends State<QuizPlayScreen> {
             )
           : _error != null
           ? Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    _error!,
-                    style: const TextStyle(color: Colors.red),
-                    textAlign: TextAlign.center,
-                  ),
-                  const SizedBox(height: 10),
-                  ElevatedButton(
-                    onPressed: _generateNewQuestion,
-                    child: const Text("Retry"),
-                  ),
-                ],
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      _error!,
+                      style: const TextStyle(color: Colors.red),
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 10),
+                    ElevatedButton(
+                      onPressed: _generateNewQuestion,
+                      child: const Text("Retry"),
+                    ),
+                  ],
+                ),
               ),
             )
-          : Padding(
+          : SingleChildScrollView(
               padding: const EdgeInsets.all(16.0),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -544,7 +620,7 @@ class _QuizPlayScreenState extends State<QuizPlayScreen> {
                     );
                   }).toList(),
 
-                  const Spacer(),
+                  const SizedBox(height: 20),
 
                   // Bottom Button
                   SizedBox(
