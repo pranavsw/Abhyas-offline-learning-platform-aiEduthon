@@ -38,6 +38,7 @@ dependencies:
   tflite_flutter: ^0.11.0
   sqflite: ^2.3.0
   path: ^1.9.0
+  
 
 
 dev_dependencies:
@@ -66,6 +67,7 @@ flutter:
     - assets/class9_complete.db
     - assets/mobile_embedding.tflite
     - assets/vocab.txt
+    - assets/class9_english.json
   # To add assets to your application, add an assets section, like this:
   # assets:
   #   - images/a_dot_burr.jpeg
