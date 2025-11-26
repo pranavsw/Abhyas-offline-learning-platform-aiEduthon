@@ -89,17 +89,45 @@ class _LoadingScreenState extends State<LoadingScreen> {
       await RagService.instance.initialize();
 
       // 3. Download & Load Gemma Model
+      // 3. Download & Load Gemma Model
       setState(() => _status = "Downloading AI Model...");
-      await FlutterGemma.installModel(
-        modelType: ModelType.gemmaIt,
-      ).fromNetwork(kModelUrl, token: kHuggingFaceToken).withProgress((val) {
-        if (mounted) {
-          setState(() {
-            _progress = 0.2 + (val / 100 * 0.6); // Map 0-100 to 0.2-0.8
-            _status = "Downloading AI... $val%";
-          });
+
+      try {
+        await FlutterGemma.installModel(
+          modelType: ModelType.gemmaIt,
+        ).fromNetwork(kModelUrl, token: kHuggingFaceToken).withProgress((val) {
+          if (mounted) {
+            setState(() {
+              _progress = 0.2 + (val / 100 * 0.6); // Map 0-100 to 0.2-0.8
+              _status = "Downloading AI... $val%";
+            });
+          }
+        }).install();
+      } catch (e) {
+        // Handle Resume/ETag errors by forcing a fresh download
+        if (e.toString().contains("TaskResumeException") ||
+            e.toString().contains("ETag")) {
+          debugPrint("Download mismatch detected. Retrying with fresh URL...");
+          setState(() => _status = "Retrying Download (Fresh)...");
+
+          // Append timestamp to force new download task
+          final freshUrl =
+              "$kModelUrl?retry=${DateTime.now().millisecondsSinceEpoch}";
+
+          await FlutterGemma.installModel(
+            modelType: ModelType.gemmaIt,
+          ).fromNetwork(freshUrl, token: kHuggingFaceToken).withProgress((val) {
+            if (mounted) {
+              setState(() {
+                _progress = 0.2 + (val / 100 * 0.6);
+                _status = "Downloading (Retry)... $val%";
+              });
+            }
+          }).install();
+        } else {
+          rethrow;
         }
-      }).install();
+      }
 
       setState(() {
         _status = "Loading Model into RAM...";
