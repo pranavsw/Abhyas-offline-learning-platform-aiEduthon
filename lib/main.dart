@@ -6,7 +6,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_gemma/flutter_gemma.dart';
-import 'package:path/path.dart';
+import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 
@@ -299,14 +299,15 @@ class _QuizPlayScreenState extends State<QuizPlayScreen> {
   bool _isAnswerRevealed = false;
   String? _error;
 
+  // Persistent chat session to avoid memory leaks
+  InferenceChat? _chatSession;
+  int _questionsGeneratedCount = 0;
+
   @override
   void initState() {
     super.initState();
     _generateNewQuestion();
   }
-
-  // Persistent chat session to avoid memory leaks
-  InferenceChat? _chatSession;
 
   @override
   void dispose() {
@@ -323,37 +324,48 @@ class _QuizPlayScreenState extends State<QuizPlayScreen> {
       _questionData = null;
     });
 
-    try {
-      // 1. Get Context
-      String context = BookService.instance.getRandomContextForChapter(
-        widget.chapterTitle,
-      );
+    int retryCount = 0;
+    const maxRetries = 3;
 
-      if (context.isEmpty) throw "No content available";
-
-      String question = "";
-      String correctAnswer = "";
-      List<String> options = [];
-
-      // 2. Initialize Model & Chat (Reuse session if possible)
-      if (_chatSession == null) {
-        final model = await FlutterGemma.getActiveModel(
-          preferredBackend: PreferredBackend.cpu,
+    while (retryCount < maxRetries) {
+      try {
+        // 1. Get Context
+        String context = BookService.instance.getRandomContextForChapter(
+          widget.chapterTitle,
         );
-        _chatSession = await model.createChat();
-      }
 
-      // ---------------------------------------------------------
-      // SINGLE STEP: Generate Question, Answer & Distractors (JSON)
-      // ---------------------------------------------------------
-      // Inject random seed to force new generation
-      final randomId = Random().nextInt(10000);
-      String prompt =
-          """Context:
+        if (context.isEmpty) throw "No content available";
+
+        String question = "";
+        String correctAnswer = "";
+        List<String> options = [];
+
+        // 2. Initialize Model & Chat
+        // REFRESH STRATEGY: Re-create session every 5 questions to clear context
+        if (_chatSession == null || _questionsGeneratedCount >= 5) {
+          debugPrint("Refreshing AI Session...");
+          _chatSession = null; // Help GC
+          await Future.delayed(
+            const Duration(seconds: 1),
+          ); // Longer delay for safety
+
+          final model = await FlutterGemma.getActiveModel(
+            preferredBackend: PreferredBackend.cpu,
+          );
+          _chatSession = await model.createChat();
+          _questionsGeneratedCount = 0;
+        }
+
+        // ---------------------------------------------------------
+        // SINGLE STEP: Generate Question, Answer & Distractors (JSON)
+        // ---------------------------------------------------------
+        final randomId = Random().nextInt(10000);
+        String prompt =
+            """Context:
 $context
 
 Task ID: $randomId
-Task: Generate 1 UNIQUE multiple-choice question, its correct answer, and 3 plausible WRONG options based on the text.
+Task: Generate 1 UNIQUE multiple-choice question, its correct answer, and 3 related but wrong options based on the text provided.
 Output strictly in JSON format:
 {
   "question": "The question text here",
@@ -362,82 +374,119 @@ Output strictly in JSON format:
 }
 Do not add any other text.""";
 
-      await _chatSession!.addQueryChunk(
-        Message.text(text: prompt, isUser: true),
-      );
+        await _chatSession!.addQueryChunk(
+          Message.text(text: prompt, isUser: true),
+        );
 
-      String response = "";
-      int tokenCount = 0;
-      await for (final event in _chatSession!.generateChatResponseAsync()) {
-        if (event is TextResponse) {
-          String t = event.token;
-          if (t.contains('<bos>') || t.contains('<eos>')) continue;
-          response += t;
-          if (++tokenCount > 150) break; // Increased limit for full JSON
-        }
-      }
+        String response = "";
+        int tokenCount = 0;
 
-      // Parse JSON
-      try {
-        String jsonStr = response.replaceAll(RegExp(r'```json|```'), '').trim();
-        int start = jsonStr.indexOf('{');
-        int end = jsonStr.lastIndexOf('}');
-        if (start != -1 && end != -1) {
-          jsonStr = jsonStr.substring(start, end + 1);
-          final data = jsonDecode(jsonStr);
-          question = data['question'] ?? "";
-          correctAnswer = data['answer'] ?? "";
-          if (data['distractors'] is List) {
-            List<dynamic> dists = data['distractors'];
-            options = dists.map((e) => e.toString().trim()).toList();
+        // Add Timeout to prevent infinite loading
+        await for (final event
+            in _chatSession!.generateChatResponseAsync().timeout(
+              const Duration(seconds: 25),
+            )) {
+          if (event is TextResponse) {
+            String t = event.token;
+            if (t.contains('<bos>') || t.contains('<eos>')) continue;
+            response += t;
+            if (++tokenCount > 250) break;
           }
         }
+
+        _questionsGeneratedCount++;
+
+        // Parse JSON
+        try {
+          String jsonStr = response
+              .replaceAll(RegExp(r'```json|```'), '')
+              .trim();
+          int start = jsonStr.indexOf('{');
+          int end = jsonStr.lastIndexOf('}');
+          if (start != -1 && end != -1) {
+            jsonStr = jsonStr.substring(start, end + 1);
+            final data = jsonDecode(jsonStr);
+            question = data['question'] ?? "";
+            correctAnswer = data['answer'] ?? "";
+            if (data['distractors'] is List) {
+              List<dynamic> dists = data['distractors'];
+              options = dists.map((e) => e.toString().trim()).toList();
+            }
+          }
+        } catch (e) {
+          debugPrint("JSON Parse Error: $e");
+        }
+
+        if (question.isEmpty || correctAnswer.isEmpty) {
+          _useDeterministicFallback(context);
+          return;
+        }
+
+        // Filter valid distractors
+        options = options
+            .where(
+              (l) =>
+                  l.isNotEmpty &&
+                  l.toLowerCase() != correctAnswer.toLowerCase(),
+            )
+            .take(3)
+            .toList();
+
+        // Combine & Randomize
+        options = [correctAnswer, ...options];
+
+        // Ensure 4 options
+        int fallbackCount = 1;
+        while (options.length < 4) {
+          options.add("Option $fallbackCount");
+          fallbackCount++;
+        }
+
+        options.shuffle();
+
+        if (mounted) {
+          setState(() {
+            _questionData = {
+              'question': question,
+              'options': options,
+              'correct_answer': correctAnswer,
+            };
+            _isLoading = false;
+          });
+        }
+        return; // Success!
       } catch (e) {
-        debugPrint("JSON Parse Error: $e");
-      }
+        debugPrint("Quiz Gen Error (Attempt ${retryCount + 1}): $e");
 
-      if (question.isEmpty || correctAnswer.isEmpty) {
+        // Handle Race Condition specifically
+        if (e.toString().contains("IllegalStateException") ||
+            e.toString().contains("Previous invocation")) {
+          debugPrint("Model busy, waiting...");
+          await Future.delayed(const Duration(seconds: 2));
+          retryCount++;
+          continue; // Retry loop
+        }
+
+        // If it's not a race condition (e.g. timeout), break and show error or fallback
+        _chatSession = null; // Force reset
+        break;
+      }
+    }
+
+    // If all retries failed
+    if (mounted) {
+      // Try fallback one last time
+      try {
+        String context = BookService.instance.getRandomContextForChapter(
+          widget.chapterTitle,
+        );
         _useDeterministicFallback(context);
-        return;
+      } catch (e) {
+        setState(() {
+          _error = "Failed to generate question. Please try again.";
+          _isLoading = false;
+        });
       }
-
-      // Filter valid distractors
-      options = options
-          .where(
-            (l) =>
-                l.isNotEmpty && l.toLowerCase() != correctAnswer.toLowerCase(),
-          )
-          .take(3)
-          .toList();
-
-      // ---------------------------------------------------------
-      // Combine & Randomize
-      // ---------------------------------------------------------
-      options = [correctAnswer, ...options];
-
-      int fallbackCount = 1;
-      while (options.length < 4) {
-        options.add("Option $fallbackCount");
-        fallbackCount++;
-      }
-
-      options.shuffle();
-
-      setState(() {
-        _questionData = {
-          'question': question,
-          'options': options,
-          'correct_answer': correctAnswer,
-        };
-        _isLoading = false;
-      });
-    } catch (e) {
-      debugPrint("Quiz Gen Error: $e");
-      setState(() {
-        _error = "Error: $e";
-        _isLoading = false;
-      });
-      _chatSession = null;
     }
   }
 
@@ -455,17 +504,30 @@ Do not add any other text.""";
     words.shuffle();
 
     List<String> options = words.take(4).toList();
-    if (options.isEmpty)
-      options = ["Option A", "Option B", "Option C", "Option D"];
 
-    setState(() {
-      _questionData = {
-        'question': question,
-        'options': options,
-        'correct_answer': options[0],
-      };
-      _isLoading = false;
-    });
+    // Robust Fallback: Ensure 4 options
+    List<String> fillers = [
+      "None of the above",
+      "All of the above",
+      "Information not provided",
+      "Check the textbook",
+    ];
+    int fillerIndex = 0;
+    while (options.length < 4) {
+      options.add(fillers[fillerIndex % fillers.length]);
+      fillerIndex++;
+    }
+
+    if (mounted) {
+      setState(() {
+        _questionData = {
+          'question': question,
+          'options': options,
+          'correct_answer': options[0],
+        };
+        _isLoading = false;
+      });
+    }
   }
 
   @override
@@ -641,6 +703,23 @@ class _ChatScreenState extends State<ChatScreen> {
   // Helper to init chat if not ready
   InferenceChat? _chatSession;
 
+  @override
+  void dispose() {
+    _chatSession = null;
+    super.dispose();
+  }
+
+  void _resetChat() {
+    setState(() {
+      _messages.clear();
+      _chatSession = null;
+      _isGenerating = false;
+    });
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text("Chat history cleared!")));
+  }
+
   Future<void> _handleSend() async {
     if (_textController.text.trim().isEmpty || _isGenerating) return;
 
@@ -692,7 +771,11 @@ Answer:
       });
 
       int badTokenCount = 0;
-      final stream = _chatSession!.generateChatResponseAsync();
+      // Add timeout to prevent freeze
+      final stream = _chatSession!.generateChatResponseAsync().timeout(
+        const Duration(seconds: 30),
+      );
+
       await for (final event in stream) {
         if (event is TextResponse && event.token.isNotEmpty) {
           String token = event.token;
@@ -713,6 +796,8 @@ Answer:
       setState(
         () => _messages.last = _messages.last.copyWith(text: "Error: $e"),
       );
+      // If error is timeout or memory, force reset next time
+      _chatSession = null;
     } finally {
       setState(() => _isGenerating = false);
     }
@@ -721,15 +806,31 @@ Answer:
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text("Chat Tutor")),
+      appBar: AppBar(
+        title: const Text("Chat Tutor"),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            tooltip: "Clear Chat",
+            onPressed: _isGenerating ? null : _resetChat,
+          ),
+        ],
+      ),
       body: Column(
         children: [
           Expanded(
-            child: ListView.builder(
-              padding: const EdgeInsets.all(16),
-              itemCount: _messages.length,
-              itemBuilder: (ctx, i) => ChatBubble(message: _messages[i]),
-            ),
+            child: _messages.isEmpty
+                ? Center(
+                    child: Text(
+                      "Ask me anything about Class 9 English!",
+                      style: TextStyle(color: Colors.grey),
+                    ),
+                  )
+                : ListView.builder(
+                    padding: const EdgeInsets.all(16),
+                    itemCount: _messages.length,
+                    itemBuilder: (ctx, i) => ChatBubble(message: _messages[i]),
+                  ),
           ),
           Padding(
             padding: const EdgeInsets.all(8.0),
@@ -842,7 +943,7 @@ class RagService {
       );
 
       // Load DB
-      var dbPath = join(await getDatabasesPath(), "class9_complete.db");
+      var dbPath = p.join(await getDatabasesPath(), "class9_complete.db");
       ByteData data = await rootBundle.load("assets/class9_complete.db");
       await File(dbPath).writeAsBytes(
         data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
