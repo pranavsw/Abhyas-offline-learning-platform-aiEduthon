@@ -310,9 +310,6 @@ class _QuizPlayScreenState extends State<QuizPlayScreen> {
 
   @override
   void dispose() {
-    // Note: InferenceChat doesn't have a dispose method exposed in the package currently,
-    // but we should at least null it out. The underlying C++ resources *should* be managed by the GC
-    // or the FlutterGemma singleton, but creating NEW sessions repeatedly was the issue.
     _chatSession = null;
     super.dispose();
   }
@@ -347,89 +344,65 @@ class _QuizPlayScreenState extends State<QuizPlayScreen> {
       }
 
       // ---------------------------------------------------------
-      // STEP 1: Generate Question and Correct Answer
+      // SINGLE STEP: Generate Question, Answer & Distractors (JSON)
       // ---------------------------------------------------------
-      // We use a "Forget previous" trick or just context injection to keep it stateless-ish
-      String prompt1 =
+      // Inject random seed to force new generation
+      final randomId = Random().nextInt(10000);
+      String prompt =
           """Context:
 $context
 
-Task: Write 1 simple question and its correct answer based on the text.
-Format:
-Q: [Question]
-A: [Answer]""";
-
-      // Note: We are appending to history. To prevent context window explosion after 10 questions,
-      // we ideally need a way to clear history. Since the package doesn't expose it,
-      // we will rely on the fact that we are reusing the session.
-      // IF the model gets confused by previous questions, we might need to force a new session
-      // every X questions. For now, let's try reusing it to fix the CRASH.
+Task ID: $randomId
+Task: Generate 1 UNIQUE multiple-choice question, its correct answer, and 3 plausible WRONG options based on the text.
+Output strictly in JSON format:
+{
+  "question": "The question text here",
+  "answer": "The correct answer here",
+  "distractors": ["Wrong option 1", "Wrong option 2", "Wrong option 3"]
+}
+Do not add any other text.""";
 
       await _chatSession!.addQueryChunk(
-        Message.text(text: prompt1, isUser: true),
+        Message.text(text: prompt, isUser: true),
       );
 
-      String response1 = "";
+      String response = "";
       int tokenCount = 0;
       await for (final event in _chatSession!.generateChatResponseAsync()) {
         if (event is TextResponse) {
           String t = event.token;
           if (t.contains('<bos>') || t.contains('<eos>')) continue;
-          response1 += t;
-          if (++tokenCount > 60) break;
+          response += t;
+          if (++tokenCount > 150) break; // Increased limit for full JSON
         }
       }
 
-      // Parse Step 1
-      final qMatch = RegExp(r'Q:\s*(.+)').firstMatch(response1);
-      final aMatch = RegExp(r'A:\s*(.+)').firstMatch(response1);
-
-      if (qMatch != null && aMatch != null) {
-        question = qMatch.group(1)!.trim();
-        correctAnswer = aMatch.group(1)!.trim();
-      } else {
-        // Fallback parsing
-        final parts = response1
-            .split('\n')
-            .where((l) => l.trim().isNotEmpty)
-            .toList();
-        if (parts.length >= 2) {
-          question = parts[0].replaceAll('Q:', '').trim();
-          correctAnswer = parts[1].replaceAll('A:', '').trim();
-        } else {
-          _useDeterministicFallback(context);
-          return;
+      // Parse JSON
+      try {
+        String jsonStr = response.replaceAll(RegExp(r'```json|```'), '').trim();
+        int start = jsonStr.indexOf('{');
+        int end = jsonStr.lastIndexOf('}');
+        if (start != -1 && end != -1) {
+          jsonStr = jsonStr.substring(start, end + 1);
+          final data = jsonDecode(jsonStr);
+          question = data['question'] ?? "";
+          correctAnswer = data['answer'] ?? "";
+          if (data['distractors'] is List) {
+            List<dynamic> dists = data['distractors'];
+            options = dists.map((e) => e.toString().trim()).toList();
+          }
         }
+      } catch (e) {
+        debugPrint("JSON Parse Error: $e");
       }
 
-      // ---------------------------------------------------------
-      // STEP 2: Generate Distractors (Wrong Options)
-      // ---------------------------------------------------------
-      String prompt2 = """Task: Write 3 short WRONG answers for that question.
-Format:
-1. [Wrong1]
-2. [Wrong2]
-3. [Wrong3]""";
-
-      await _chatSession!.addQueryChunk(
-        Message.text(text: prompt2, isUser: true),
-      );
-
-      String response2 = "";
-      tokenCount = 0;
-      await for (final event in _chatSession!.generateChatResponseAsync()) {
-        if (event is TextResponse) {
-          String t = event.token;
-          if (t.contains('<bos>') || t.contains('<eos>')) continue;
-          response2 += t;
-          if (++tokenCount > 60) break;
-        }
+      if (question.isEmpty || correctAnswer.isEmpty) {
+        _useDeterministicFallback(context);
+        return;
       }
 
-      // Parse Step 2
-      final wrongOptions = response2
-          .split('\n')
-          .map((l) => l.replaceAll(RegExp(r'^\d+\.\s*'), '').trim())
+      // Filter valid distractors
+      options = options
           .where(
             (l) =>
                 l.isNotEmpty && l.toLowerCase() != correctAnswer.toLowerCase(),
@@ -440,12 +413,10 @@ Format:
       // ---------------------------------------------------------
       // Combine & Randomize
       // ---------------------------------------------------------
-      options = [correctAnswer, ...wrongOptions];
+      options = [correctAnswer, ...options];
 
-      // Ensure we ALWAYS have 4 options
       int fallbackCount = 1;
       while (options.length < 4) {
-        // Generate a dummy option that looks slightly real if possible, or just generic
         options.add("Option $fallbackCount");
         fallbackCount++;
       }
@@ -466,7 +437,6 @@ Format:
         _error = "Error: $e";
         _isLoading = false;
       });
-      // If error (e.g. context limit), reset session
       _chatSession = null;
     }
   }
