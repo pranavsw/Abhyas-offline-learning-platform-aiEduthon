@@ -53,7 +53,7 @@ class NCERTTutorApp extends StatelessWidget {
 }
 
 // -----------------------------------------------------------------------------
-// 1. LOADING & INITIALIZATION SCREEN (Unchanged Logic)
+// 1. LOADING SCREEN
 // -----------------------------------------------------------------------------
 class LoadingScreen extends StatefulWidget {
   const LoadingScreen({super.key});
@@ -74,60 +74,47 @@ class _LoadingScreenState extends State<LoadingScreen> {
 
   Future<void> _startInitialization() async {
     try {
-      // 1. Load Book Content (JSON)
-      setState(() => _status = "Reading Textbook...");
+      // 1. Load Book Content
+      setState(() => _status = "Reading Textbooks...");
       await BookService.instance.loadBookData();
 
-      // 2. Initialize RAG Engine (DB & Tokenizer)
+      // 2. Initialize RAG
       setState(() {
         _status = "Preparing Search Engine...";
         _progress = 0.2;
       });
       await RagService.instance.initialize();
 
-      // 3. Download & Load Gemma Model
+      // 3. Download Model
       setState(() => _status = "Downloading AI Model...");
-
       try {
         await FlutterGemma.installModel(
           modelType: ModelType.gemmaIt,
         ).fromNetwork(kModelUrl, token: kHuggingFaceToken).withProgress((val) {
           if (mounted) {
             setState(() {
-              _progress = 0.2 + (val / 100 * 0.6); // Map 0-100 to 0.2-0.8
+              _progress = 0.2 + (val / 100 * 0.6);
               _status = "Downloading AI... $val%";
             });
           }
         }).install();
       } catch (e) {
-        // Retry logic for resumed downloads
-        if (e.toString().contains("TaskResumeException") ||
-            e.toString().contains("ETag")) {
-          debugPrint("Download mismatch detected. Retrying...");
-          setState(() => _status = "Retrying Download...");
+        if (e.toString().contains("TaskResumeException")) {
           final freshUrl =
               "$kModelUrl?retry=${DateTime.now().millisecondsSinceEpoch}";
           await FlutterGemma.installModel(
             modelType: ModelType.gemmaIt,
-          ).fromNetwork(freshUrl, token: kHuggingFaceToken).withProgress((val) {
-            if (mounted) {
-              setState(() {
-                _progress = 0.2 + (val / 100 * 0.6);
-                _status = "Downloading (Retry)... $val%";
-              });
-            }
-          }).install();
+          ).fromNetwork(freshUrl, token: kHuggingFaceToken).install();
         } else {
           rethrow;
         }
       }
 
       setState(() {
-        _status = "Loading Model into RAM...";
+        _status = "Loading Model...";
         _progress = 0.9;
       });
 
-      // Force CPU for compatibility
       await FlutterGemma.getActiveModel(
         preferredBackend: PreferredBackend.cpu,
         maxTokens: 1024,
@@ -135,7 +122,7 @@ class _LoadingScreenState extends State<LoadingScreen> {
 
       if (mounted) {
         Navigator.pushReplacement(
-          this.context,
+          context,
           MaterialPageRoute(builder: (_) => const HomeScreen()),
         );
       }
@@ -171,7 +158,7 @@ class _LoadingScreenState extends State<LoadingScreen> {
 }
 
 // -----------------------------------------------------------------------------
-// 2. HOME SCREEN (Menu with Subject Selection)
+// 2. HOME SCREEN
 // -----------------------------------------------------------------------------
 class HomeScreen extends StatelessWidget {
   const HomeScreen({super.key});
@@ -198,7 +185,7 @@ class HomeScreen extends StatelessWidget {
               icon: Icons.chat_bubble_outline,
               label: "Chat with Tutor",
               color: Colors.blue.shade100,
-              onTap: () => _openChat(context), // Changed to open Dialog
+              onTap: () => _openChat(context),
             ),
             const SizedBox(height: 20),
             _MenuButton(
@@ -219,7 +206,7 @@ class HomeScreen extends StatelessWidget {
   }
 }
 
-// --- NEW WIDGET: Subject Selection Dialog ---
+// Subject Selection Dialog (Chat)
 class SubjectSelectionDialog extends StatefulWidget {
   const SubjectSelectionDialog({super.key});
 
@@ -236,8 +223,7 @@ class _SubjectSelectionDialogState extends State<SubjectSelectionDialog> {
     if (_englishSelected) selectedSubjects.add("English");
     if (_scienceSelected) selectedSubjects.add("Science");
 
-    // Navigate to ChatScreen with the selected filters
-    Navigator.pop(context); // Close dialog
+    Navigator.pop(context);
     Navigator.push(
       context,
       MaterialPageRoute(
@@ -253,12 +239,10 @@ class _SubjectSelectionDialogState extends State<SubjectSelectionDialog> {
       content: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Text(
-            "Which subject do you have a doubt in? (Select none to search everything)",
-          ),
+          const Text("Choose subjects to filter context (Optional)"),
           const SizedBox(height: 16),
           CheckboxListTile(
-            title: const Text("English (Beehive / Moments)"),
+            title: const Text("English"),
             value: _englishSelected,
             onChanged: (val) => setState(() => _englishSelected = val!),
           ),
@@ -328,41 +312,93 @@ class _MenuButton extends StatelessWidget {
 }
 
 // -----------------------------------------------------------------------------
-// 3. QUIZ FEATURE (Unchanged)
+// 3. QUIZ FEATURE (UPDATED: Subject Filtering)
 // -----------------------------------------------------------------------------
 
 // Screen 3A: Chapter Selection
-class ChapterSelectionScreen extends StatelessWidget {
+class ChapterSelectionScreen extends StatefulWidget {
   const ChapterSelectionScreen({super.key});
 
   @override
+  State<ChapterSelectionScreen> createState() => _ChapterSelectionScreenState();
+}
+
+class _ChapterSelectionScreenState extends State<ChapterSelectionScreen> {
+  String _selectedSubject = "English"; // Default
+
+  @override
   Widget build(BuildContext context) {
-    final chapters = BookService.instance.getAllChapters();
+    // Get chapters filtered by the selected subject
+    final chapters = BookService.instance.getChaptersForSubject(
+      _selectedSubject,
+    );
 
     return Scaffold(
       appBar: AppBar(title: const Text("Select Chapter")),
-      body: ListView.builder(
-        itemCount: chapters.length,
-        padding: const EdgeInsets.all(16),
-        itemBuilder: (context, index) {
-          final chapter = chapters[index];
-          return Card(
-            margin: const EdgeInsets.only(bottom: 12),
-            child: ListTile(
-              leading: CircleAvatar(child: Text("${index + 1}")),
-              title: Text(chapter),
-              trailing: const Icon(Icons.arrow_forward_ios, size: 16),
-              onTap: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => QuizPlayScreen(chapterTitle: chapter),
+      body: Column(
+        children: [
+          // Subject Toggle
+          Container(
+            padding: const EdgeInsets.all(16),
+            color: Colors.indigo.shade50,
+            child: Row(
+              children: [
+                const Text(
+                  "Subject: ",
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(width: 10),
+                ChoiceChip(
+                  label: const Text("English"),
+                  selected: _selectedSubject == "English",
+                  onSelected: (b) =>
+                      setState(() => _selectedSubject = "English"),
+                ),
+                const SizedBox(width: 10),
+                ChoiceChip(
+                  label: const Text("Science"),
+                  selected: _selectedSubject == "Science",
+                  onSelected: (b) =>
+                      setState(() => _selectedSubject = "Science"),
+                ),
+              ],
+            ),
+          ),
+          // Chapter List
+          Expanded(
+            child: ListView.builder(
+              itemCount: chapters.length,
+              padding: const EdgeInsets.all(16),
+              itemBuilder: (context, index) {
+                final chapter = chapters[index];
+                return Card(
+                  margin: const EdgeInsets.only(bottom: 12),
+                  child: ListTile(
+                    leading: CircleAvatar(
+                      backgroundColor: _selectedSubject == "English"
+                          ? Colors.blue.shade100
+                          : Colors.green.shade100,
+                      child: Text("${index + 1}"),
+                    ),
+                    title: Text(chapter),
+                    trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+                    onTap: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => QuizPlayScreen(
+                            chapterTitle: chapter,
+                            subject: _selectedSubject, // Pass subject!
+                          ),
+                        ),
+                      );
+                    },
                   ),
                 );
               },
             ),
-          );
-        },
+          ),
+        ],
       ),
     );
   }
@@ -371,7 +407,13 @@ class ChapterSelectionScreen extends StatelessWidget {
 // Screen 3B: Playing the Quiz
 class QuizPlayScreen extends StatefulWidget {
   final String chapterTitle;
-  const QuizPlayScreen({super.key, required this.chapterTitle});
+  final String subject; // New Parameter
+
+  const QuizPlayScreen({
+    super.key,
+    required this.chapterTitle,
+    required this.subject,
+  });
 
   @override
   State<QuizPlayScreen> createState() => _QuizPlayScreenState();
@@ -408,11 +450,13 @@ class _QuizPlayScreenState extends State<QuizPlayScreen> {
     });
 
     try {
+      // 1. Get Context using Subject + Chapter
       String context = BookService.instance.getRandomContextForChapter(
         widget.chapterTitle,
+        widget.subject,
       );
 
-      if (context.isEmpty) throw "No content available";
+      if (context.isEmpty) throw "No content available for this chapter.";
 
       if (_chatSession == null || _questionsGeneratedCount >= 5) {
         _chatSession = null;
@@ -433,7 +477,7 @@ Task ID: $randomId
 Task: Generate 1 UNIQUE multiple-choice question, its correct answer, and 3 related but wrong options based on the text provided.
 Output strictly in JSON format:
 {
-  "question": "The question text here",
+  "question": "Question text",
   "answer": "The correct answer here",
   "distractors": ["Wrong option 1", "Wrong option 2", "Wrong option 3"]
 }
@@ -451,12 +495,12 @@ Do not add any other text.""";
           String t = event.token;
           if (t.contains('<bos>') || t.contains('<eos>')) continue;
           response += t;
-          if (++tokenCount > 250) break;
+          if (++tokenCount > 300) break;
         }
       }
       _questionsGeneratedCount++;
 
-      // Simple Fallback JSON parsing logic
+      // Parsing
       Map<String, dynamic> data;
       try {
         String jsonStr = response.replaceAll(RegExp(r'```json|```'), '').trim();
@@ -595,15 +639,12 @@ Do not add any other text.""";
 }
 
 // -----------------------------------------------------------------------------
-// 4. CHAT SCREEN (Updated with Subject Filtering)
+// 4. CHAT SCREEN (Unchanged)
 // -----------------------------------------------------------------------------
 class ChatScreen extends StatefulWidget {
-  final List<String> enabledSubjects; // New Parameter
+  final List<String> enabledSubjects;
 
-  const ChatScreen({
-    super.key,
-    this.enabledSubjects = const [], // Default: empty means search all
-  });
+  const ChatScreen({super.key, this.enabledSubjects = const []});
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
@@ -652,22 +693,19 @@ class _ChatScreenState extends State<ChatScreen> {
     });
 
     try {
-      // 1. Search Vector DB with Filter
       String context = await RagService.instance.searchForContext(
         query,
-        subjects: widget.enabledSubjects, // Pass the selected subjects
+        subjects: widget.enabledSubjects,
       );
 
       String prompt =
-          """
-You are a AI Tutor. Answer based on this textbook context:
+          """You are a AI Tutor. Answer based on this context:
 $context
 
 Student: $query
 Answer:
 """;
 
-      // 2. Generate
       if (_chatSession == null) {
         final model = await FlutterGemma.getActiveModel(
           preferredBackend: PreferredBackend.cpu,
@@ -679,9 +717,7 @@ Answer:
         Message.text(text: prompt, isUser: true),
       );
 
-      setState(() {
-        _messages.last = _messages.last.copyWith(text: "");
-      });
+      setState(() => _messages.last = _messages.last.copyWith(text: ""));
 
       int badTokenCount = 0;
       final stream = _chatSession!.generateChatResponseAsync().timeout(
@@ -696,7 +732,6 @@ Answer:
             if (badTokenCount > 5) break;
             continue;
           }
-
           setState(() {
             final last = _messages.last;
             _messages.last = last.copyWith(text: last.text + token);
@@ -772,64 +807,86 @@ Answer:
 }
 
 // -----------------------------------------------------------------------------
-// SERVICES & HELPERS
+// SERVICES (UPDATED FOR SCIENCE + ENGLISH)
 // -----------------------------------------------------------------------------
 
-// A. BOOK SERVICE
 class BookService {
   static final BookService instance = BookService._();
   BookService._();
 
-  Map<String, dynamic>? _bookData;
+  // Store chapters separately: { "English": [...], "Science": [...] }
+  Map<String, List<Map<String, dynamic>>> _chaptersBySubject = {
+    "English": [],
+    "Science": [],
+  };
 
   Future<void> loadBookData() async {
     try {
-      final jsonString = await rootBundle.loadString(
-        'assets/class9_english.json',
+      // 1. Load English
+      final engJson = await rootBundle.loadString('assets/class9_english.json');
+      final engData = jsonDecode(engJson);
+      _chaptersBySubject["English"] = List<Map<String, dynamic>>.from(
+        engData['Chapters'],
       );
-      _bookData = jsonDecode(jsonString);
+
+      // 2. Load Science
+      final sciJson = await rootBundle.loadString('assets/class9_science.json');
+      final sciData = jsonDecode(sciJson);
+
+      // Science JSON sometimes uses lowercase 'chapters' or Uppercase
+      final sciList = sciData['Chapters'] ?? sciData['chapters'];
+      if (sciList != null) {
+        _chaptersBySubject["Science"] = List<Map<String, dynamic>>.from(
+          sciList,
+        );
+      }
+
       debugPrint(
-        "Book Loaded. Chapters: ${(_bookData!['Chapters'] as List).length}",
+        "Books Loaded. Eng: ${_chaptersBySubject['English']!.length}, Sci: ${_chaptersBySubject['Science']!.length}",
       );
     } catch (e) {
-      debugPrint("Failed to load book JSON: $e");
+      debugPrint("Failed to load books: $e");
     }
   }
 
-  List<String> getAllChapters() {
-    if (_bookData == null) return [];
-    return (_bookData!['Chapters'] as List)
+  List<String> getChaptersForSubject(String subject) {
+    if (!_chaptersBySubject.containsKey(subject)) return [];
+
+    return _chaptersBySubject[subject]!
         .map((c) => c['chapter_title'].toString())
         .toList();
   }
 
-  String getRandomContextForChapter(String chapterTitle) {
-    if (_bookData == null) return "";
+  String getRandomContextForChapter(String chapterTitle, String subject) {
+    // 1. Get Chapters for specific subject
+    final chapters = _chaptersBySubject[subject];
+    if (chapters == null) return "";
 
-    final chapters = _bookData!['Chapters'] as List;
+    // 2. Find the Chapter object
     final chapter = chapters.firstWhere(
       (c) => c['chapter_title'] == chapterTitle,
-      orElse: () => null,
+      orElse: () => <String, dynamic>{}, // Empty map fallback
     );
 
-    if (chapter == null) return "";
+    if (chapter.isEmpty) return "";
 
-    final topics = chapter['topics'] as List;
-    if (topics.isEmpty) return "";
+    // 3. Get Topics
+    final topics = chapter['topics'] as List?;
+    if (topics == null || topics.isEmpty) return "";
 
+    // 4. Randomly Select Context
     var random = Random();
     var topic = topics[random.nextInt(topics.length)];
 
-    String content = topic['content'].toString();
-    if (content.length > 300) {
-      content = content.substring(0, 300) + "...";
+    String content = topic['content']?.toString() ?? "";
+    if (content.length > 350) {
+      content = content.substring(0, 350) + "...";
     }
 
-    return "TOPIC: ${topic['topic']}\nCONTENT: $content";
+    return "SUBJECT: $subject\nCHAPTER: $chapterTitle\nTOPIC: ${topic['topic'] ?? 'General'}\nCONTENT: $content";
   }
 }
 
-// B. RAG SERVICE (Updated for Subject Filtering)
 class RagService {
   static final RagService instance = RagService._();
   RagService._();
@@ -861,7 +918,6 @@ class RagService {
     }
   }
 
-  // UPDATED SEARCH FUNCTION
   Future<String> searchForContext(
     String query, {
     List<String> subjects = const [],
@@ -869,24 +925,16 @@ class RagService {
     if (_db == null || _interpreter == null) return "";
     try {
       List<double> vector = _getEmbedding(query);
-
-      // Build WHERE clause dynamically
       String whereClause = "";
       List<String> whereArgs = [];
 
       if (subjects.isNotEmpty) {
         List<String> bookNames = [];
-
-        // Map user selection to actual DB book_source names
-        if (subjects.contains("English")) {
+        if (subjects.contains("English"))
           bookNames.addAll(['Beehive', 'Moments', 'Words & Expressions 1']);
-        }
-        if (subjects.contains("Science")) {
-          bookNames.add('Science');
-        }
+        if (subjects.contains("Science")) bookNames.add('Science');
 
         if (bookNames.isNotEmpty) {
-          // Create placeholders like (?, ?, ?)
           String placeholders = List.filled(bookNames.length, '?').join(',');
           whereClause = "WHERE book_source IN ($placeholders)";
           whereArgs = bookNames;
@@ -899,7 +947,6 @@ class RagService {
       );
 
       List<Map<String, dynamic>> scored = [];
-
       for (var row in rows) {
         Uint8List blob = row['embedding'] as Uint8List;
         var buffer = blob.buffer.asByteData();
@@ -909,7 +956,6 @@ class RagService {
         }
         scored.add({'score': score, 'text': row['display_text']});
       }
-
       scored.sort(
         (a, b) => (b['score'] as double).compareTo(a['score'] as double),
       );
@@ -926,21 +972,16 @@ class RagService {
       if (_vocab!.containsKey(w)) ids.add(_vocab![w]!);
     });
     ids.add(102);
-
     if (ids.length < 128)
       ids.addAll(List.filled(128 - ids.length, 0));
     else
       ids = ids.sublist(0, 128);
-
     var output = List.filled(384, 0.0).reshape([1, 384]);
     _interpreter!.run([ids, List.filled(128, 1)], {0: output});
     return List<double>.from(output[0]);
   }
 }
 
-// -----------------------------------------------------------------------------
-// HELPERS
-// -----------------------------------------------------------------------------
 class ChatMessage {
   final String text;
   final bool isUser;
