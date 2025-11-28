@@ -34,7 +34,15 @@ dependencies:
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
-  flutter_gemma: ^0.11.0
+  flutter_gemma: ^0.11.2
+  tflite_flutter: ^0.11.0
+  sqflite: ^2.3.0
+  path: ^1.9.0
+  shared_preferences: ^2.5.3
+  google_fonts: ^6.3.2
+  provider: ^6.1.5+1
+  
+
 
 dev_dependencies:
   flutter_test:
@@ -58,6 +66,12 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
+  assets:
+    - assets/class9_complete.db
+    - assets/mobile_embedding.tflite
+    - assets/vocab.txt
+    - assets/class9_english.json
+    - assets/class9_science.json
   # To add assets to your application, add an assets section, like this:
   # assets:
   #   - images/a_dot_burr.jpeg
