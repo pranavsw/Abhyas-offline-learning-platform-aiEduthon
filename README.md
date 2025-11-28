@@ -1,4 +1,4 @@
-# NCERT AI Tutor: Offline On-Device RAG Application
+# Offline AI Tutor *ABHYAS*: Offline On-Device RAG Application
 
 A sophisticated educational application built with Flutter that brings a personal AI tutor to mobile devices. It functions **completely offline** (after initial model download) by leveraging **On-Device RAG (Retrieval Augmented Generation)**.
 
