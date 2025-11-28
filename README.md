@@ -2,7 +2,7 @@
 
 A sophisticated educational application built with Flutter that brings a personal AI tutor to mobile devices. It functions **completely offline** (after initial model download) by leveraging **On-Device RAG (Retrieval Augmented Generation)**.
 
-The app combines Google's **Gemma 2B LLM** with a vector database to answer student questions, generate quizzes, and summarize chapters from NCERT Class 9 Textbooks (English & Science) without sending data to the cloud.
+The app combines Google's **Gemma3-1B-IT** with a vector database to answer student questions, generate quizzes, and summarize chapters from NCERT Class 9 Textbooks (English & Science) without sending data to the cloud.
 
 ## 🚀 Features
 
